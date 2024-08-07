@@ -36,7 +36,8 @@ final class TranscribeTask {
     func run(
         audioArray: [Float],
         decodeOptions: DecodingOptions? = nil,
-        callback: TranscriptionCallback = nil
+        callback: TranscriptionCallback = nil,
+        segmentsCallback:  (([TranscriptionSegment]) -> Bool)
     ) async throws -> TranscriptionResult {
         let interval = Logging.beginSignpost("TranscribeAudio", signposter: Logging.TranscribeTask.signposter)
         defer { Logging.endSignpost("TranscribeAudio", interval: interval, signposter: Logging.TranscribeTask.signposter) }
@@ -231,6 +232,13 @@ final class TranscribeTask {
                 }
 
                 // add them to the `allSegments` list
+                
+                var earlyFinish = false
+//                if let segmentsCallback = segmentsCallback {
+                    let shouldContinue = segmentsCallback(currentSegments)
+                    earlyFinish = !shouldContinue
+//                }
+                
                 allSegments.append(contentsOf: currentSegments)
                 let allCurrentTokens = currentSegments.flatMap { $0.tokens }
                 allTokens.append(contentsOf: allCurrentTokens)
@@ -247,6 +255,12 @@ final class TranscribeTask {
                 // Update the progress
                 let clipProgress = min(seek, seekClipEnd) - seekClipStart
                 progress.completedUnitCount = previousSeekProgress + Int64(clipProgress)
+                
+                //Check if we need to return earlier
+                if earlyFinish {
+                    break
+                }
+                
             }
         }
 

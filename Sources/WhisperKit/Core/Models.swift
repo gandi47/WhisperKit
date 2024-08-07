@@ -602,6 +602,18 @@ public struct TranscriptionProgress {
 /// - Note: This callback should be lightweight and return as quickly as possible to avoid extra decoding loops
 public typealias TranscriptionCallback = ((TranscriptionProgress) -> Bool?)?
 
+
+/// Callback to receive segments updates during transcription.
+///
+/// - Parameters:
+///   - segments: The current transcription segments
+///
+/// - Returns: A Boolean value indicating whether to continue the whole transcription process or stop early.
+///   - `true`: Continue the transcription process.
+///   - `false`: Stop the transcription process early.
+/// - Note: This callback should be lightweight and return as quickly as possible to avoid extra decoding loops
+public typealias SegmentsCallback = (([TranscriptionSegment]) -> Bool)
+
 public struct TranscriptionTimings: Codable {
     public var pipelineStart: CFAbsoluteTime
     public var firstTokenTime: CFAbsoluteTime
