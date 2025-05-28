@@ -49,6 +49,7 @@ public extension WhisperMLModel {
 
 // MARK: - Whisper Models
 
+@frozen
 public enum ModelVariant: CustomStringConvertible, CaseIterable {
     case tiny
     case tinyEn
@@ -100,6 +101,7 @@ public enum ModelVariant: CustomStringConvertible, CaseIterable {
     }
 }
 
+@frozen
 public enum ModelState: CustomStringConvertible {
     case unloading
     case unloaded
@@ -127,7 +129,7 @@ public enum ModelState: CustomStringConvertible {
             case .downloading:
                 return "Downloading"
             case .downloaded:
-                return "Downloading"
+                return "Downloaded"
         }
     }
 }
@@ -165,16 +167,165 @@ public struct ModelComputeOptions {
     }
 }
 
+public struct ModelSupport: Codable, Equatable {
+    public let `default`: String
+    public let supported: [String]
+    /// Computed on init of ModelRepoConfig
+    public var disabled: [String] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case `default`, supported
+    }
+
+    public init(
+        default: String,
+        supported: [String],
+        disabled: [String] = []
+    ) {
+        self.default = `default`
+        self.supported = supported
+        self.disabled = disabled
+    }
+}
+
+public struct DeviceSupport: Codable {
+    /// Optional chip name string, intended for annotation only, e.g. "A16, A17"
+    public let chips: String?
+    /// Device identifiers, e.g. ["iPhone15,2", "iPhone15,3"]
+    public let identifiers: [String]
+    /// Model support for the device identifiers provided
+    public var models: ModelSupport
+
+    public init(chips: String? = nil, identifiers: [String], models: ModelSupport) {
+        self.chips = chips
+        self.identifiers = identifiers
+        self.models = models
+    }
+}
+
+public struct ModelSupportConfig: Codable {
+    public let repoName: String
+    public let repoVersion: String
+    public var deviceSupports: [DeviceSupport]
+    /// Computed on init
+    public private(set) var knownModels: [String]
+    public private(set) var defaultSupport: DeviceSupport
+
+    enum CodingKeys: String, CodingKey {
+        case repoName = "name"
+        case repoVersion = "version"
+        case deviceSupports = "device_support"
+    }
+
+    public init(from decoder: Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let repoName = try container.decode(String.self, forKey: .repoName)
+        let repoVersion = try container.decode(String.self, forKey: .repoVersion)
+        let deviceSupports = try container.decode([DeviceSupport].self, forKey: .deviceSupports)
+
+        self.init(repoName: repoName, repoVersion: repoVersion, deviceSupports: deviceSupports)
+    }
+
+    public init(repoName: String, repoVersion: String, deviceSupports: [DeviceSupport], includeFallback: Bool = true) {
+        self.repoName = repoName
+        self.repoVersion = repoVersion
+
+        // Only use fallback for associated model repo
+        if includeFallback,
+           Constants.fallbackModelSupportConfig.repoName.contains(repoName) {
+            self.deviceSupports = Self.mergeDeviceSupport(remote: deviceSupports, fallback: Constants.fallbackModelSupportConfig.deviceSupports)
+            self.knownModels = self.deviceSupports.flatMap { $0.models.supported }.orderedSet
+        } else {
+            self.deviceSupports = deviceSupports
+            self.knownModels = deviceSupports.flatMap { $0.models.supported }.orderedSet
+        }
+
+        // Add default device support with all models supported for unknown devices
+        self.defaultSupport = DeviceSupport(
+            identifiers: [],
+            models: ModelSupport(
+                default: "openai_whisper-base",
+                supported: self.knownModels
+            )
+        )
+
+        computeDisabledModels()
+    }
+
+    @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+    public func modelSupport(for deviceIdentifier: String = WhisperKit.deviceName()) -> ModelSupport {
+        // Find the support with the longest matching identifier prefix
+        // i.e. `iPad13,16` should match exact `iPad13,16` instead of first prefix like `iPad13,1`
+        var bestMatch: (support: DeviceSupport, prefixLength: Int)? = nil
+        for support in deviceSupports {
+            for identifier in support.identifiers {
+                if deviceIdentifier.hasPrefix(identifier) {
+                    let matchLength = identifier.count
+                    if bestMatch == nil || matchLength > bestMatch!.prefixLength {
+                        bestMatch = (support, matchLength)
+                    }
+                }
+            }
+        }
+
+        if let match = bestMatch {
+            Logging.debug("Matched \(deviceIdentifier) to devices: \(match.support.identifiers)")
+            return match.support.models
+        }
+
+        Logging.info("No device support found for \(deviceIdentifier), using default")
+        return defaultSupport.models
+    }
+
+    private mutating func computeDisabledModels() {
+        for i in 0..<deviceSupports.count {
+            let disabledModels = Set(knownModels).subtracting(deviceSupports[i].models.supported)
+            self.deviceSupports[i].models.disabled = Array(disabledModels)
+        }
+    }
+
+    private static func mergeDeviceSupport(remote: [DeviceSupport], fallback: [DeviceSupport]) -> [DeviceSupport] {
+        var mergedSupports: [DeviceSupport] = []
+        let remoteIdentifiers = Set(remote.flatMap { $0.identifiers })
+
+        // Add remote device supports, merging with fallback if identifiers overlap
+        for remoteSupport in remote {
+            if let fallbackSupport = fallback.first(where: { $0.identifiers.contains(where: remoteSupport.identifiers.contains) }) {
+                let mergedModels = ModelSupport(
+                    default: remoteSupport.models.default,
+                    supported: (remoteSupport.models.supported + fallbackSupport.models.supported).orderedSet
+                )
+                mergedSupports.append(DeviceSupport(chips: remoteSupport.chips, identifiers: remoteSupport.identifiers, models: mergedModels))
+            } else {
+                mergedSupports.append(remoteSupport)
+            }
+        }
+
+        // Add fallback device supports that don't overlap with remote
+        for fallbackSupport in fallback where !fallbackSupport.identifiers.contains(where: remoteIdentifiers.contains) {
+            mergedSupports.append(fallbackSupport)
+        }
+
+        return mergedSupports
+    }
+}
+
 // MARK: - Chunking
 
 public struct AudioChunk {
     public var seekOffsetIndex: Int
     public var audioSamples: [Float]
+
+    public init(seekOffsetIndex: Int, audioSamples: [Float]) {
+        self.seekOffsetIndex = seekOffsetIndex
+        self.audioSamples = audioSamples
+    }
 }
 
 // MARK: - Decoding
 
-public enum DecodingTask: CustomStringConvertible, CaseIterable {
+@frozen
+public enum DecodingTask: Codable, CustomStringConvertible, CaseIterable {
     case transcribe
     case translate
 
@@ -188,7 +339,7 @@ public enum DecodingTask: CustomStringConvertible, CaseIterable {
     }
 }
 
-public struct DecodingInputs {
+open class DecodingInputs {
     public var initialPrompt: [Int]
     public var inputIds: MLMultiArray
     public var cacheLength: MLMultiArray
@@ -240,133 +391,22 @@ public struct DecodingCache {
     public var keyCache: MLMultiArray?
     public var valueCache: MLMultiArray?
     public var alignmentWeights: MLMultiArray?
-    public init(keyCache: MLMultiArray? = nil, valueCache: MLMultiArray? = nil, alignmentWeights: MLMultiArray? = nil) {
+
+    public init(
+        keyCache: MLMultiArray? = nil,
+        valueCache: MLMultiArray? = nil,
+        alignmentWeights: MLMultiArray? = nil
+    ) {
         self.keyCache = keyCache
         self.valueCache = valueCache
         self.alignmentWeights = alignmentWeights
     }
 }
 
-public enum ChunkingStrategy: String, CaseIterable {
+@frozen
+public enum ChunkingStrategy: String, Codable, CaseIterable {
     case none
     case vad
-}
-
-/// Options for how to transcribe an audio file using WhisperKit.
-///
-/// - Parameters:
-///   - verbose: Whether to display the text being decoded to the console.
-///              If true, displays all details; if false, displays minimal details;
-///   - task: Whether to perform X->X speech recognition ('transcribe') or X->English translation ('translate')
-///   - language: Language spoken in the audio
-///   - temperature: Temperature to use for sampling.
-///   - temperatureIncrementOnFallback: Increment which will be
-///                  successively added to temperature upon failures according to either `compressionRatioThreshold`
-///                  or `logProbThreshold`.
-///   - temperatureFallbackCount: Number of times to increment temperature on fallback.
-///   - sampleLength: The maximum number of tokens to sample.
-///   - topK: Number of candidates when sampling with non-zero temperature.
-///   - usePrefillPrompt: If true, the prefill tokens will be forced according to task and language settings.
-///   - usePrefillCache: If true, the kv cache will be prefilled based on the prefill data mlmodel.
-///   - detectLanguage: Use this in conjuntion with `usePrefillPrompt: true` to detect the language of the input audio.
-///   - skipSpecialTokens: Whether to skip special tokens in the output.
-///   - withoutTimestamps: Whether to include timestamps in the transcription result.
-///   - wordTimestamps: Whether to include word-level timestamps in the transcription result.
-///   - maxInitialTimestamp: Maximal initial timestamp.
-///   - clipTimestamps: Array of timestamps (in seconds) to split the audio into segments for transcription.
-///   - promptTokens: Array of token IDs to use as the conditioning prompt for the decoder. These are prepended to the prefill tokens.
-///   - prefixTokens: Array of token IDs to use as the initial prefix for the decoder. These are appended to the prefill tokens.
-///   - suppressBlank: If true, blank tokens will be suppressed during decoding.
-///   - supressTokens: List of token IDs to suppress during decoding.
-///   - compressionRatioThreshold: If the compression ratio of the transcription text is above this value, it is too repetitive and treated as failed.
-///   - logProbThreshold: If the average log probability over sampled tokens is below this value, treat as failed.
-///   - firstTokenLogProbThreshold: If the log probability over the first sampled token is below this value, treat as failed.
-///   - noSpeechThreshold: If the no speech probability is higher than this value AND the average log
-///                        probability over sampled tokens is below `logProbThreshold`, consider the segment as silent.
-@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
-public struct DecodingOptions {
-    public var verbose: Bool
-    public var task: DecodingTask
-    public var language: String?
-    public var temperature: Float
-    public var temperatureIncrementOnFallback: Float
-    public var temperatureFallbackCount: Int
-    public var sampleLength: Int
-    public var topK: Int
-    public var usePrefillPrompt: Bool
-    public var usePrefillCache: Bool
-    public var detectLanguage: Bool
-    public var skipSpecialTokens: Bool
-    public var withoutTimestamps: Bool
-    public var wordTimestamps: Bool
-    public var maxInitialTimestamp: Float?
-    public var clipTimestamps: [Float]
-    public var promptTokens: [Int]?
-    public var prefixTokens: [Int]?
-    public var suppressBlank: Bool
-    public var supressTokens: [Int]
-    public var compressionRatioThreshold: Float?
-    public var logProbThreshold: Float?
-    public var firstTokenLogProbThreshold: Float?
-    public var noSpeechThreshold: Float?
-    public var concurrentWorkerCount: Int
-    public var chunkingStrategy: ChunkingStrategy?
-
-    public init(
-        verbose: Bool = false,
-        task: DecodingTask = .transcribe,
-        language: String? = nil,
-        temperature: Float = 0.0,
-        temperatureIncrementOnFallback: Float = 0.2,
-        temperatureFallbackCount: Int = 5,
-        sampleLength: Int = Constants.maxTokenContext,
-        topK: Int = 5,
-        usePrefillPrompt: Bool = true,
-        usePrefillCache: Bool = true,
-        detectLanguage: Bool? = nil,
-        skipSpecialTokens: Bool = false,
-        withoutTimestamps: Bool = false,
-        wordTimestamps: Bool = false,
-        maxInitialTimestamp: Float? = nil,
-        clipTimestamps: [Float] = [],
-        promptTokens: [Int]? = nil,
-        prefixTokens: [Int]? = nil,
-        suppressBlank: Bool = false,
-        supressTokens: [Int]? = nil,
-        compressionRatioThreshold: Float? = 2.4,
-        logProbThreshold: Float? = -1.0,
-        firstTokenLogProbThreshold: Float? = -1.5,
-        noSpeechThreshold: Float? = 0.6,
-        concurrentWorkerCount: Int = 16,
-        chunkingStrategy: ChunkingStrategy? = nil
-    ) {
-        self.verbose = verbose
-        self.task = task
-        self.language = language
-        self.temperature = temperature
-        self.temperatureIncrementOnFallback = temperatureIncrementOnFallback
-        self.temperatureFallbackCount = temperatureFallbackCount
-        self.sampleLength = sampleLength
-        self.topK = topK
-        self.usePrefillPrompt = usePrefillPrompt
-        self.usePrefillCache = usePrefillCache
-        self.detectLanguage = detectLanguage ?? !usePrefillPrompt // If prefill is false, detect language by default
-        self.skipSpecialTokens = skipSpecialTokens
-        self.withoutTimestamps = withoutTimestamps
-        self.wordTimestamps = wordTimestamps
-        self.maxInitialTimestamp = maxInitialTimestamp
-        self.clipTimestamps = clipTimestamps
-        self.promptTokens = promptTokens
-        self.prefixTokens = prefixTokens
-        self.suppressBlank = suppressBlank
-        self.supressTokens = supressTokens ?? [] // nonSpeechTokens() // TODO: implement these as default
-        self.compressionRatioThreshold = compressionRatioThreshold
-        self.logProbThreshold = logProbThreshold
-        self.firstTokenLogProbThreshold = firstTokenLogProbThreshold
-        self.noSpeechThreshold = noSpeechThreshold
-        self.concurrentWorkerCount = concurrentWorkerCount
-        self.chunkingStrategy = chunkingStrategy
-    }
 }
 
 @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
@@ -437,7 +477,20 @@ public struct DecodingResult {
                               fallback: nil)
     }
 
-    public init(language: String, languageProbs: [String: Float], tokens: [Int], tokenLogProbs: [[Int: Float]], text: String, avgLogProb: Float, noSpeechProb: Float, temperature: Float, compressionRatio: Float, cache: DecodingCache? = nil, timings: TranscriptionTimings? = nil, fallback: DecodingFallback? = nil) {
+    public init(
+        language: String,
+        languageProbs: [String: Float],
+        tokens: [Int],
+        tokenLogProbs: [[Int: Float]],
+        text: String,
+        avgLogProb: Float,
+        noSpeechProb: Float,
+        temperature: Float,
+        compressionRatio: Float,
+        cache: DecodingCache? = nil,
+        timings: TranscriptionTimings? = nil,
+        fallback: DecodingFallback? = nil
+    ) {
         self.language = language
         self.languageProbs = languageProbs
         self.tokens = tokens
@@ -453,6 +506,7 @@ public struct DecodingResult {
     }
 }
 
+@frozen
 public enum WhisperError: Error, LocalizedError, Equatable {
     case tokenizerUnavailable(String = "Tokenizer is unavailable")
     case modelsUnavailable(String = "Models are unavailable")
@@ -513,6 +567,20 @@ public struct TranscriptionResult: Codable {
     public var language: String
     public var timings: TranscriptionTimings
     public var seekTime: Float?
+
+    public init(
+        text: String,
+        segments: [TranscriptionSegment],
+        language: String,
+        timings: TranscriptionTimings,
+        seekTime: Float? = nil
+    ) {
+        self.text = text
+        self.segments = segments
+        self.language = language
+        self.timings = timings
+        self.seekTime = seekTime
+    }
 
     public func logSegments() {
         for (i, segment) in segments.enumerated() {
@@ -584,6 +652,7 @@ public struct TranscriptionResult: Codable {
         Total Tokens:                  \(totalTokens)
         Tokens per Second:             \(String(format: "%.2f", tokensPerSecond)) tok/s
         Real Time Factor:              \(String(format: "%.3f", rtf))
+        Speed Factor:                  \(String(format: "%.3f", 1.0 / rtf))
         Fallbacks:                     \(timings.totalDecodingFallbacks)
         """)
     }
@@ -596,18 +665,51 @@ public extension TranscriptionResult {
 }
 
 public struct TranscriptionSegment: Hashable, Codable {
-    public var id: Int = 0
-    public var seek: Int = 0
-    public var start: Float = 0.0
-    public var end: Float = 0.0
-    public var text: String = ""
-    public var tokens: [Int] = []
-    public var tokenLogProbs: [[Int: Float]] = [[:]]
-    public var temperature: Float = 1.0
-    public var avgLogprob: Float = 0.0
-    public var compressionRatio: Float = 1.0
-    public var noSpeechProb: Float = 0.0
-    public var words: [WordTiming]? = nil
+    public var id: Int
+    public var seek: Int
+    public var start: Float
+    public var end: Float
+    public var text: String
+    public var tokens: [Int]
+    public var tokenLogProbs: [[Int: Float]]
+    public var temperature: Float
+    public var avgLogprob: Float
+    public var compressionRatio: Float
+    public var noSpeechProb: Float
+    public var words: [WordTiming]?
+
+    /// Computed property for the duration of the segment
+    public var duration: Float {
+        return end - start
+    }
+
+    public init(
+        id: Int = 0,
+        seek: Int = 0,
+        start: Float = 0.0,
+        end: Float = 0.0,
+        text: String = "",
+        tokens: [Int] = [],
+        tokenLogProbs: [[Int: Float]] = [[:]],
+        temperature: Float = 1.0,
+        avgLogprob: Float = 0.0,
+        compressionRatio: Float = 1.0,
+        noSpeechProb: Float = 0.0,
+        words: [WordTiming]? = nil
+    ) {
+        self.id = id
+        self.seek = seek
+        self.start = start
+        self.end = end
+        self.text = text
+        self.tokens = tokens
+        self.tokenLogProbs = tokenLogProbs
+        self.temperature = temperature
+        self.avgLogprob = avgLogprob
+        self.compressionRatio = compressionRatio
+        self.noSpeechProb = noSpeechProb
+        self.words = words
+    }
 }
 
 public struct WordTiming: Hashable, Codable {
@@ -616,6 +718,19 @@ public struct WordTiming: Hashable, Codable {
     public var start: Float
     public var end: Float
     public var probability: Float
+
+    /// Computed property for the duration of the word
+    public var duration: Float {
+        return end - start
+    }
+
+    public init(word: String, tokens: [Int], start: Float, end: Float, probability: Float) {
+        self.word = word
+        self.tokens = tokens
+        self.start = start
+        self.end = end
+        self.probability = probability
+    }
 }
 
 public struct TranscriptionProgress {
@@ -635,6 +750,48 @@ public struct TranscriptionProgress {
         self.avgLogprob = avgLogprob
         self.compressionRatio = compressionRatio
         self.windowId = windowId
+    }
+}
+
+// Callbacks to receive state updates during transcription.
+
+/// A callback that provides transcription segments as they are discovered.
+/// - Parameters:
+///   - segments: An array of `TranscriptionSegment` objects representing the transcribed segments
+public typealias SegmentDiscoveryCallback = (_ segments: [TranscriptionSegment]) -> Void
+
+/// A callback that reports changes in the model's state.
+/// - Parameters:
+///   - oldState: The previous state of the model, if any
+///   - newState: The current state of the model
+public typealias ModelStateCallback = (_ oldState: ModelState?, _ newState: ModelState) -> Void
+
+/// A callback that reports changes in the transcription process.
+/// - Parameter state: The current `TranscriptionState` of the transcription process
+public typealias TranscriptionStateCallback = (_ state: TranscriptionState) -> Void
+
+/// Represents the different states of the transcription process.
+@frozen
+public enum TranscriptionState: CustomStringConvertible {
+    /// The audio is being converted to the required format for transcription
+    case convertingAudio
+
+    /// The audio is actively being transcribed to text
+    case transcribing
+
+    /// The transcription process has completed
+    case finished
+
+    /// A human-readable description of the transcription state
+    public var description: String {
+        switch self {
+            case .convertingAudio:
+                return "Converting Audio"
+            case .transcribing:
+                return "Transcribing"
+            case .finished:
+                return "Finished"
+        }
     }
 }
 
@@ -670,6 +827,8 @@ public struct TranscriptionTimings: Codable {
     public var prewarmLoadTime: TimeInterval
     public var encoderLoadTime: TimeInterval
     public var decoderLoadTime: TimeInterval
+    public var encoderSpecializationTime: TimeInterval
+    public var decoderSpecializationTime: TimeInterval
     public var tokenizerLoadTime: TimeInterval
     public var audioLoading: TimeInterval
     public var audioProcessing: TimeInterval
@@ -714,6 +873,8 @@ public struct TranscriptionTimings: Codable {
                 prewarmLoadTime: TimeInterval = 0,
                 encoderLoadTime: TimeInterval = 0,
                 decoderLoadTime: TimeInterval = 0,
+                encoderSpecializationTime: TimeInterval = 0,
+                decoderSpecializationTime: TimeInterval = 0,
                 tokenizerLoadTime: TimeInterval = 0,
                 audioLoading: TimeInterval = 0,
                 audioProcessing: TimeInterval = 0,
@@ -747,6 +908,8 @@ public struct TranscriptionTimings: Codable {
         self.prewarmLoadTime = prewarmLoadTime
         self.encoderLoadTime = encoderLoadTime
         self.decoderLoadTime = decoderLoadTime
+        self.encoderSpecializationTime = encoderSpecializationTime
+        self.decoderSpecializationTime = decoderSpecializationTime
         self.tokenizerLoadTime = tokenizerLoadTime
         self.audioLoading = audioLoading
         self.audioProcessing = audioProcessing
@@ -1165,17 +1328,40 @@ public struct SpecialTokens {
     }
 }
 
-public protocol WhisperTokenizer: Tokenizer {
+public protocol WhisperTokenizer {
+    /// swift-transformers pass through
+    func encode(text: String) -> [Int]
+    func decode(tokens: [Int]) -> String
+    func convertTokenToId(_ token: String) -> Int?
+    func convertIdToToken(_ id: Int) -> String?
+
+    /// WhisperKit specific
     var specialTokens: SpecialTokens { get }
     var allLanguageTokens: Set<Int> { get }
 
     func splitToWordTokens(tokenIds: [Int]) -> (words: [String], wordTokens: [[Int]])
 }
 
-struct WhisperTokenizerWrapper: WhisperTokenizer {
+open class WhisperTokenizerWrapper: WhisperTokenizer {
     let tokenizer: any Tokenizer
-    let specialTokens: SpecialTokens
-    let allLanguageTokens: Set<Int>
+    public let specialTokens: SpecialTokens
+    public let allLanguageTokens: Set<Int>
+
+    public func encode(text: String) -> [Int] {
+        tokenizer.encode(text: text)
+    }
+
+    public func decode(tokens: [Int]) -> String {
+        tokenizer.decode(tokens: tokens)
+    }
+
+    public func convertTokenToId(_ token: String) -> Int? {
+        tokenizer.convertTokenToId(token)
+    }
+
+    public func convertIdToToken(_ id: Int) -> String? {
+        tokenizer.convertIdToToken(id)
+    }
 
     init(tokenizer: any Tokenizer) {
         let specialTokens = SpecialTokens(
@@ -1267,7 +1453,7 @@ struct WhisperTokenizerWrapper: WhisperTokenizer {
     /// Decodes token ids into individual words and per-word subtokens
     /// - Parameter tokenIds: Array of tokens to decode and then split
     /// - Returns: Tuple containing and array of the split words and all tokens for each word
-    func splitToWordTokens(tokenIds: [Int]) -> (words: [String], wordTokens: [[Int]]) {
+    public func splitToWordTokens(tokenIds: [Int]) -> (words: [String], wordTokens: [[Int]]) {
         let decodedWords = tokenizer.decode(tokens: tokenIds.filter { $0 < specialTokens.specialTokenBegin })
 
         // Detect language of input text
@@ -1280,52 +1466,6 @@ struct WhisperTokenizerWrapper: WhisperTokenizer {
         } else {
             return splitTokensOnSpaces(tokens: tokenIds)
         }
-    }
-}
-
-extension WhisperTokenizerWrapper: Tokenizer {
-    func tokenize(text: String) -> [String] {
-        tokenizer.tokenize(text: text)
-    }
-
-    func encode(text: String) -> [Int] {
-        tokenizer.encode(text: text)
-    }
-
-    func decode(tokens: [Int]) -> String {
-        tokenizer.decode(tokens: tokens)
-    }
-
-    func convertTokenToId(_ token: String) -> Int? {
-        tokenizer.convertTokenToId(token)
-    }
-
-    func convertIdToToken(_ id: Int) -> String? {
-        tokenizer.convertIdToToken(id)
-    }
-
-    var bosToken: String? {
-        tokenizer.bosToken
-    }
-
-    var bosTokenId: Int? {
-        tokenizer.bosTokenId
-    }
-
-    var eosToken: String? {
-        tokenizer.eosToken
-    }
-
-    var eosTokenId: Int? {
-        tokenizer.eosTokenId
-    }
-
-    var unknownToken: String? {
-        tokenizer.unknownToken
-    }
-
-    var unknownTokenId: Int? {
-        tokenizer.unknownTokenId
     }
 }
 
@@ -1346,6 +1486,7 @@ extension WhisperTokenizerWrapper {
 
 // MARK: Constants
 
+@frozen
 public enum Constants {
     enum Logging {
         static let subsystem = "com.argmax.whisperkit"
@@ -1475,4 +1616,185 @@ public enum Constants {
     public static let defaultLanguageCode: String = "en"
 
     public static let defaultAudioReadFrameSize: AVAudioFrameCount = 1_323_000 // 30s of audio at commonly found 44.1khz sample rate
+
+    public static let defaultWindowSamples: Int = 480_000 // 30s of audio at 16khz sample rate default for Whisper models
+
+    public static let defaultPrependPunctuations: String = "\"'“¡¿([{-"
+    public static let defaultAppendPunctuations: String = "\"'.。,，!！?？:：”)]}、"
+
+    public static let fallbackModelSupportConfig: ModelSupportConfig = {
+        var config = ModelSupportConfig(
+            repoName: "whisperkit-coreml-fallback",
+            repoVersion: "0.3",
+            deviceSupports: [
+                DeviceSupport(
+                    chips: "A12, A13, S9, S10",
+                    identifiers: [
+                        "iPhone11",
+                        "iPhone12",
+                        "Watch7",
+                        "Watch8"
+                    ],
+                    models: ModelSupport(
+                        default: "openai_whisper-tiny",
+                        supported: [
+                            "openai_whisper-base",
+                            "openai_whisper-base.en",
+                            "openai_whisper-tiny",
+                            "openai_whisper-tiny.en",
+                        ]
+                    )
+                ),
+                DeviceSupport(
+                    chips: "A14",
+                    identifiers: [
+                        "iPhone13",
+                        "iPad13,1",
+                        "iPad13,2",
+                        "iPad13,18",
+                        "iPad13,19"
+                    ],
+                    models: ModelSupport(
+                        default: "openai_whisper-base",
+                        supported: [
+                            "openai_whisper-tiny",
+                            "openai_whisper-tiny.en",
+                            "openai_whisper-base",
+                            "openai_whisper-base.en",
+                            "openai_whisper-small",
+                            "openai_whisper-small.en",
+                        ]
+                    )
+                ),
+                DeviceSupport(
+                    chips: "A15, A16, A17 Pro, A18",
+                    identifiers: [
+                        "iPhone14",
+                        "iPhone15",
+                        "iPhone16",
+                        "iPhone17",
+                        "iPad14,1",
+                        "iPad14,2",
+                        "iPad15,7",
+                        "iPad15,8",
+                        "iPad16,1",
+                        "iPad16,2"
+                    ],
+                    models: ModelSupport(
+                        default: "openai_whisper-base",
+                        supported: [
+                            "openai_whisper-tiny",
+                            "openai_whisper-tiny.en",
+                            "openai_whisper-base",
+                            "openai_whisper-base.en",
+                            "openai_whisper-small",
+                            "openai_whisper-small.en",
+                            "openai_whisper-large-v2_949MB",
+                            "openai_whisper-large-v2_turbo_955MB",
+                            "openai_whisper-large-v3_947MB",
+                            "openai_whisper-large-v3_turbo_954MB",
+                            "distil-whisper_distil-large-v3_594MB",
+                            "distil-whisper_distil-large-v3_turbo_600MB",
+                            "openai_whisper-large-v3-v20240930_626MB",
+                            "openai_whisper-large-v3-v20240930_turbo_632MB",
+                        ]
+                    )
+                ),
+                DeviceSupport(
+                    chips: "M1",
+                    identifiers: [
+                        "MacBookPro17,1",
+                        "MacBookPro18,1",
+                        "MacBookPro18,2",
+                        "MacBookPro18,3",
+                        "MacBookPro18,4",
+                        "MacBookAir10,1",
+                        "Macmini9,1",
+                        "iMac21,1",
+                        "iMac21,2",
+                        "Mac13",
+                        "iPad13,4",
+                        "iPad13,5",
+                        "iPad13,6",
+                        "iPad13,7",
+                        "iPad13,8",
+                        "iPad13,9",
+                        "iPad13,10",
+                        "iPad13,11",
+                        "iPad13,16",
+                        "iPad13,17"
+                    ],
+                    models: ModelSupport(
+                        default: "openai_whisper-large-v3-v20240930_626MB",
+                        supported: [
+                            "openai_whisper-tiny",
+                            "openai_whisper-tiny.en",
+                            "openai_whisper-base",
+                            "openai_whisper-base.en",
+                            "openai_whisper-small",
+                            "openai_whisper-small.en",
+                            "openai_whisper-large-v2",
+                            "openai_whisper-large-v2_949MB",
+                            "openai_whisper-large-v3",
+                            "openai_whisper-large-v3_947MB",
+                            "distil-whisper_distil-large-v3",
+                            "distil-whisper_distil-large-v3_594MB",
+                            "openai_whisper-large-v3-v20240930",
+                            "openai_whisper-large-v3-v20240930_626MB",
+                        ]
+                    )
+                ),
+                DeviceSupport(
+                    chips: "M2, M3, M4",
+                    identifiers: [
+                        "Mac14",
+                        "Mac15",
+                        "Mac16",
+                        "iPad14,3",
+                        "iPad14,4",
+                        "iPad14,5",
+                        "iPad14,6",
+                        "iPad14,8",
+                        "iPad14,9",
+                        "iPad14,10",
+                        "iPad14,11",
+                        "iPad15",
+                        "iPad16",
+                    ],
+                    models: ModelSupport(
+                        default: "openai_whisper-large-v3-v20240930",
+                        supported: [
+                            "openai_whisper-tiny",
+                            "openai_whisper-tiny.en",
+                            "openai_whisper-base",
+                            "openai_whisper-base.en",
+                            "openai_whisper-small",
+                            "openai_whisper-small.en",
+                            "openai_whisper-large-v2",
+                            "openai_whisper-large-v2_949MB",
+                            "openai_whisper-large-v2_turbo",
+                            "openai_whisper-large-v2_turbo_955MB",
+                            "openai_whisper-large-v3",
+                            "openai_whisper-large-v3_947MB",
+                            "openai_whisper-large-v3_turbo",
+                            "openai_whisper-large-v3_turbo_954MB",
+                            "distil-whisper_distil-large-v3",
+                            "distil-whisper_distil-large-v3_594MB",
+                            "distil-whisper_distil-large-v3_turbo",
+                            "distil-whisper_distil-large-v3_turbo_600MB",
+                            "openai_whisper-large-v3-v20240930",
+                            "openai_whisper-large-v3-v20240930_turbo",
+                            "openai_whisper-large-v3-v20240930_626MB",
+                            "openai_whisper-large-v3-v20240930_turbo_632MB",
+                        ]
+                    )
+                ),
+            ],
+            includeFallback: false
+        )
+
+        return config
+    }()
+
+    public static let knownModels: [String] = fallbackModelSupportConfig.deviceSupports.flatMap { $0.models.supported }.orderedSet
 }

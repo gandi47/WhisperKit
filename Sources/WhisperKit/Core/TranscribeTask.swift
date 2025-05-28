@@ -15,6 +15,8 @@ final class TranscribeTask {
     private let textDecoder: any TextDecoding
     private let tokenizer: any WhisperTokenizer
 
+    public var segmentDiscoveryCallback: SegmentDiscoveryCallback?
+
     init(
         currentTimings: TranscriptionTimings,
         progress: Progress?,
@@ -108,17 +110,18 @@ final class TranscribeTask {
             let previousSeekProgress = progress.completedUnitCount
 
             let windowPadding = 16000 // prevent hallucinations at the end of the clip by stopping up to 1.0s early
+            let windowSamples = featureExtractor.windowSamples ?? Constants.defaultWindowSamples
             while seek < seekClipEnd - windowPadding {
                 // calculate new encoder segment features
                 let timeOffset = Float(seek) / Float(WhisperKit.sampleRate)
-                let segmentSize = min(WhisperKit.windowSamples, contentFrames - seek, seekClipEnd - seek)
+                let segmentSize = min(windowSamples, contentFrames - seek, seekClipEnd - seek)
                 let timeOffsetEnd = Float(seek + segmentSize) / Float(WhisperKit.sampleRate)
                 Logging.debug("Decoding Seek: \(seek) (\(formatTimestamp(timeOffset))s)")
                 Logging.debug("Decoding Window Size: \(segmentSize) (\(formatTimestamp(timeOffsetEnd - timeOffset))s)")
 
                 let audioProcessingStart = Date()
                 let clipAudioSamples = Array(audioArray[seek..<(seek + segmentSize)])
-                guard let audioSamples = AudioProcessor.padOrTrimAudio(fromArray: clipAudioSamples, startAt: 0, toLength: WhisperKit.windowSamples) else {
+                guard let audioSamples = AudioProcessor.padOrTrimAudio(fromArray: clipAudioSamples, startAt: 0, toLength: windowSamples) else {
                     throw WhisperError.transcriptionFailed("Audio samples are nil")
                 }
                 let processTime = Date().timeIntervalSince(audioProcessingStart)
@@ -190,8 +193,8 @@ final class TranscribeTask {
                         tokenizer: tokenizer,
                         seek: previousSeek,
                         segmentSize: segmentSize,
-                        prependPunctuations: "\"'“¿([{-",
-                        appendPunctuations: "\"'.。,，!！?？:：”)]}、",
+                        prependPunctuations: Constants.defaultPrependPunctuations,
+                        appendPunctuations: Constants.defaultAppendPunctuations,
                         lastSpeechTimestamp: Float(Double(previousSeek) / Double(WhisperKit.sampleRate)),
                         options: options,
                         timings: timings
@@ -230,6 +233,8 @@ final class TranscribeTask {
                         Logging.debug(line)
                     }
                 }
+
+                segmentDiscoveryCallback?(currentSegments)
 
                 // add them to the `allSegments` list
                 
@@ -270,7 +275,7 @@ final class TranscribeTask {
         // MARK: - Decode with Fallback Logic
 
         func decodeWithFallback(
-            encoderSegment encoderOutput: MLMultiArray,
+            encoderSegment encoderOutput: any AudioEncoderOutputType,
             decodingOptions options: DecodingOptions,
             callback: TranscriptionCallback = nil
         ) async throws -> DecodingResult {

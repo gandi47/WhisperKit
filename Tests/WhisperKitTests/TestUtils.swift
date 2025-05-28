@@ -1,5 +1,10 @@
-import CoreML
+//  For licensing see accompanying LICENSE.md file.
+//  Copyright © 2024 Argmax, Inc. All rights reserved.
+
+import Accelerate
+import AVFAudio
 import Combine
+import CoreML
 import Foundation
 @testable import WhisperKit
 import XCTest
@@ -73,6 +78,38 @@ func XCTAssertNoThrowAsync(
 // MARK: Helpers
 
 @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+extension Bundle {
+    static func current(for classObject: AnyObject? = nil) -> Bundle {
+        #if SWIFT_PACKAGE
+        return Bundle.module
+        #else
+        // Use bundle for class type if passed in
+        if let classObject = classObject {
+            return Bundle(for: type(of: classObject))
+        } else {
+            return Bundle.main
+        }
+        #endif
+    }
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+extension FileManager {
+    func allocatedSizeOfDirectory(at url: URL) throws -> Int64 {
+        guard let enumerator = enumerator(at: url, includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey]) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError, userInfo: nil)
+        }
+
+        var accumulatedSize: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            let resourceValues = try fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+            accumulatedSize += Int64(resourceValues.totalFileAllocatedSize ?? resourceValues.fileAllocatedSize ?? 0)
+        }
+        return accumulatedSize
+    }
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 extension MLMultiArray {
     /// Create `MLMultiArray` of shape [1, 1, arr.count] and fill up the last
     /// dimension with with values from arr.
@@ -110,40 +147,32 @@ extension XCTestCase {
         file: StaticString = #file,
         line: UInt = #line
     ) async throws -> [TranscriptionResult] {
-        let modelPath: String
+        let modelName: String
         switch variant {
             case .largev3:
-                modelPath = try largev3ModelPath()
+                modelName = "large-v3"
             default:
-                modelPath = try tinyModelPath()
+                modelName = "tiny"
         }
-        let computeOptions = ModelComputeOptions(
-            melCompute: .cpuOnly,
-            audioEncoderCompute: .cpuOnly,
-            textDecoderCompute: .cpuOnly,
-            prefillCompute: .cpuOnly
-        )
-        let whisperKit = try await WhisperKit(modelFolder: modelPath, computeOptions: computeOptions, verbose: true, logLevel: .debug)
+        let config = WhisperKitConfig(model: modelName, verbose: true, logLevel: .debug)
+        let whisperKit = try await WhisperKit(config)
         trackForMemoryLeaks(on: whisperKit, file: file, line: line)
 
         let audioComponents = audioFile.components(separatedBy: ".")
-        guard let audioFileURL = Bundle.module.path(forResource: audioComponents.first, ofType: audioComponents.last) else {
+        guard let audioFileURL = Bundle.current(for: self).path(forResource: audioComponents.first, ofType: audioComponents.last) else {
             throw TestError.missingFile("Missing audio file")
         }
         return try await whisperKit.transcribe(audioPath: audioFileURL, decodeOptions: options, callback: callback)
     }
 
-    func tinyModelPath() throws -> String {
-        let modelDir = "whisperkit-coreml/openai_whisper-tiny"
-        guard let modelPath = Bundle.module.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
-            throw TestError.missingFile("Failed to load model, ensure \"Models/\(modelDir)\" exists via Makefile command: `make download-models`")
-        }
-        return modelPath
+    func tinyModelPath() async throws -> String {
+        let modelDir = try await WhisperKit.download(variant: "tiny").path()
+        return modelDir
     }
 
     func largev3ModelPath() throws -> String {
         let modelDir = "whisperkit-coreml/openai_whisper-large-v3" // use faster to compile model for tests
-        guard let modelPath = Bundle.module.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
+        guard let modelPath = Bundle.current(for: self).urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
             throw TestError.missingFile("Failed to load model, ensure \"Models/\(modelDir)\" exists via Makefile command: `make download-models`")
         }
         return modelPath
@@ -151,7 +180,7 @@ extension XCTestCase {
 
     func largev3TurboModelPath() throws -> String {
         let modelDir = "whisperkit-coreml/openai_whisper-large-v3_turbo"
-        guard let modelPath = Bundle.module.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
+        guard let modelPath = Bundle.current(for: self).urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
             throw TestError.missingFile("Failed to load model, ensure \"Models/\(modelDir)\" exists via Makefile command: `make download-models`")
         }
         return modelPath
@@ -162,7 +191,7 @@ extension XCTestCase {
         var modelPaths: [String] = []
         let directory = "whisperkit-coreml"
         let resourceKeys: [URLResourceKey] = [.isDirectoryKey]
-        guard let baseurl = Bundle.module.resourceURL?.appendingPathComponent(directory) else {
+        guard let baseurl = Bundle.current(for: self).resourceURL?.appendingPathComponent(directory) else {
             throw TestError.missingDirectory("Base URL for directory \(directory) not found.")
         }
         let directoryContents = try fileManager.contentsOfDirectory(at: baseurl, includingPropertiesForKeys: resourceKeys, options: .skipsHiddenFiles)
@@ -205,6 +234,86 @@ extension XCTestCase {
         addTeardownBlock { [weak instance] in
             XCTAssertNil(instance, "Detected potential memory leak", file: file, line: line)
         }
+    }
+
+    /// Helper to create an extended audio buffer by repeating the original buffer
+    func createExtendedBuffer(from originalBuffer: AVAudioPCMBuffer, repeatCount: Int) -> AVAudioPCMBuffer {
+        let frameCount = originalBuffer.frameLength
+        let totalFrames = frameCount * AVAudioFrameCount(repeatCount)
+
+        // Create new buffer with same format but longer length
+        let extendedBuffer = AVAudioPCMBuffer(
+            pcmFormat: originalBuffer.format,
+            frameCapacity: totalFrames
+        )!
+        extendedBuffer.frameLength = totalFrames
+
+        // For each channel
+        for channel in 0..<originalBuffer.format.channelCount {
+            if let sourceData = originalBuffer.floatChannelData?[Int(channel)],
+               let targetData = extendedBuffer.floatChannelData?[Int(channel)]
+            {
+                // Use vDSP to fill the extended buffer with repeated copies
+                for i in 0..<repeatCount {
+                    let targetOffset = Int(i * Int(frameCount))
+
+                    // Use vDSP_mmov to copy memory blocks efficiently
+                    vDSP_mmov(
+                        sourceData, // Source pointer
+                        targetData.advanced(by: targetOffset), // Destination pointer
+                        vDSP_Length(frameCount), // Frame count
+                        1, // Number of channels (always 1 here since we're processing per channel)
+                        1, // Source stride
+                        1 // Destination stride
+                    )
+                }
+            }
+        }
+
+        return extendedBuffer
+    }
+
+    /// Helper to create a buffer out of a multi-channel audio file preserving the number of channels
+    func loadMultichannelAudio(fromPath audioFilePath: String) throws -> AVAudioPCMBuffer {
+        guard FileManager.default.fileExists(atPath: audioFilePath) else {
+            throw WhisperError.loadAudioFailed("Resource path does not exist \(audioFilePath)")
+        }
+
+        let audioFileURL = URL(fileURLWithPath: audioFilePath)
+
+        // Create an audio file with original format preserved
+        let audioFile = try AVAudioFile(forReading: audioFileURL)
+
+        // Create a buffer with the original format (preserving all channels)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat,
+                                            frameCapacity: AVAudioFrameCount(audioFile.length))
+        else {
+            throw WhisperError.loadAudioFailed("Unable to create audio buffer")
+        }
+
+        // Read the entire file into the buffer
+        try audioFile.read(into: buffer)
+
+        return buffer
+    }
+
+    /// Helper to measure channel processing operations
+    func measureChannelProcessing(buffer: AVAudioPCMBuffer, mode: AudioInputConfig.ChannelMode, iterations: Int = 5) -> Double {
+        // Add warm-up iterations
+        for _ in 0..<3 {
+            _ = AudioProcessor.convertToMono(buffer, mode: mode)
+        }
+
+        var totalTime: Double = 0
+        // Then measure the actual timing
+        for _ in 0..<iterations {
+            let start = CFAbsoluteTimeGetCurrent()
+            _ = AudioProcessor.convertToMono(buffer, mode: mode)
+            let end = CFAbsoluteTimeGetCurrent()
+            totalTime += (end - start)
+        }
+
+        return totalTime / Double(iterations)
     }
 }
 
@@ -276,8 +385,8 @@ extension Collection where Element == TranscriptionResult {
     }
 }
 
-extension Publisher {
-    public func withPrevious() -> AnyPublisher<(previous: Output?, current: Output), Failure> {
+public extension Publisher {
+    func withPrevious() -> AnyPublisher<(previous: Output?, current: Output), Failure> {
         scan((Output?, Output)?.none) { ($0?.1, $1) }
             .compactMap { $0 }
             .eraseToAnyPublisher()
