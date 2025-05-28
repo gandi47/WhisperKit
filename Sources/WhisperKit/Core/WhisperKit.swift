@@ -59,7 +59,8 @@ open class WhisperKit {
         prewarm: Bool? = nil,
         load: Bool? = nil,
         download: Bool = true,
-        useBackgroundDownloadSession: Bool = false
+        useBackgroundDownloadSession: Bool = false,
+        downloadProgress: ((Progress)->())? = nil
     ) async throws {
         modelCompute = computeOptions ?? ModelComputeOptions()
         self.audioProcessor = audioProcessor ?? AudioProcessor()
@@ -78,7 +79,8 @@ open class WhisperKit {
             downloadBase: downloadBase,
             modelRepo: modelRepo,
             modelFolder: modelFolder,
-            download: download
+            download: download,
+            downloadProgress: downloadProgress
         )
 
         if let prewarm = prewarm, prewarm {
@@ -217,7 +219,8 @@ open class WhisperKit {
         downloadBase: URL? = nil,
         modelRepo: String?,
         modelFolder: String?,
-        download: Bool
+        download: Bool,
+        downloadProgress: ((Progress)->())? = nil
     ) async throws {
         // Determine the model variant to use
         let modelVariant = model ?? WhisperKit.recommendedModels().default
@@ -232,7 +235,8 @@ open class WhisperKit {
                     variant: modelVariant,
                     downloadBase: downloadBase,
                     useBackgroundSession: useBackgroundDownloadSession,
-                    from: repo
+                    from: repo,
+                    progressCallback: downloadProgress
                 )
             } catch {
                 // Handle errors related to model downloading
